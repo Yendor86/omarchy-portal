@@ -40,9 +40,20 @@ git clone https://github.com/Yendor86/omarchy-portal.git ~/code/omarchy-portal
 ~/code/omarchy-portal/install.sh
 ```
 
-No sudo. It symlinks the plugin into `~/.config/omarchy/plugins/yendor.portal`
-and puts `omarchy-portal` on your PATH. Plugins reload on save; if it doesn't
-pick up, `omarchy-shell shell rescanPlugins`.
+No sudo. The installer:
+
+1. symlinks the plugin into `~/.config/omarchy/plugins/yendor.portal`
+2. puts `omarchy-portal` on your PATH at `~/.local/bin`
+3. adds `{"id": "yendor.portal"}` to the `plugins` array in `~/.config/omarchy/shell.json`
+
+Step 3 matters and is easy to miss. A user plugin that is not listed in
+`shell.json` is inert — `PluginRegistry.isEnabled()` returns false for anything
+that is not first-party and not listed, and `_syncServices()` skips it. The
+shell still logs `Local plugin changed, reloading`, reports no error, and simply
+never instantiates the service. Your shell.json is backed up to `shell.json.bak`
+first.
+
+Plugins reload on save; if it doesn't pick up, `omarchy-shell shell rescanPlugins`.
 
 ## Use
 
