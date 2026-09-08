@@ -24,6 +24,31 @@ FALLBACK_URL="http://neverssl.com"   # plain HTTP, no HSTS, always redirectable
 
 state() { nmcli -t networking connectivity 2>/dev/null || echo unknown; }
 
+# A VPN kill switch owning the default route is the one thing that makes a
+# captive portal unfixable: the tunnel cannot come up until you log in, and the
+# kill switch blocks the login page to stop exactly the kind of leak you now
+# need. NetworkManager reports "none" or "limited" rather than "portal",
+# because nothing answers at all. Detect it and say so — opening a browser
+# here would just show a spinner.
+# Are we actually attached to a network? "none" means both "no wifi at all"
+# and "joined, but nothing gets out" — only the second is our business.
+has_link() {
+  nmcli -t -f TYPE,STATE device status 2>/dev/null \
+    | grep -qE "^(wifi|ethernet):connected$"
+}
+
+killswitch_device() {
+  local dev
+  dev="$(ip route show default 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
+  case "$dev" in
+    pvpnksintrf*|*killswitch*) echo "$dev"; return 0 ;;
+  esac
+  # Also catch a plain VPN holding the default route with no route to the LAN.
+  nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
+    | grep -qiE ":(wireguard|vpn|tun)$" && { echo "$dev"; return 0; }
+  return 1
+}
+
 # Returns the portal's login URL on stdout, or nothing if we are actually online.
 detect_url() {
   local code redirect body
@@ -44,6 +69,19 @@ detect_url() {
 }
 
 open_portal() {
+  local ks
+  if ! has_link; then
+    echo "No network attached — nothing to sign in to."
+    return 1
+  fi
+  if ks="$(killswitch_device)"; then
+    notify-send -u critical -a "Portal" -i network-vpn \
+      "Turn the VPN off to sign in" \
+      "A VPN kill switch is blocking the wifi login page. Disconnect the VPN, sign in, then reconnect." 2>/dev/null
+    echo "A VPN or kill switch holds the default route (via $ks)."
+    echo "The login page cannot load until it is off. Disconnect the VPN, sign in, then reconnect."
+    return 2
+  fi
   local url; url="$(detect_url)" || url=""
   if [[ -z "$url" ]]; then
     echo "No captive portal detected — connectivity is '$(state)'."
@@ -57,7 +95,11 @@ open_portal() {
 
 case "${1:-open}" in
   open)   open_portal ;;
-  status) echo "connectivity: $(state)"; u="$(detect_url)" && echo "portal: $u" || echo "portal: none" ;;
+  status)
+    echo "connectivity: $(state)"
+    if ks="$(killswitch_device)"; then echo "vpn: holding the default route via $ks — sign-in will fail until it is off"
+    else echo "vpn: not in the way"; fi
+    u="$(detect_url)" && echo "portal: $u" || echo "portal: none" ;;
   url)    detect_url ;;
   *) echo "usage: omarchy-portal [open|status|url]" >&2; exit 2 ;;
 esac

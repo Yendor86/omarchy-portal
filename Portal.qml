@@ -33,7 +33,13 @@ Item {
     if (next === root.lastState) return
     root.lastState = next
     logEvent("connectivity", next)
-    if (next !== "portal") return
+    // "portal" is the clean case. But a VPN kill switch, or a portal that
+    // simply drops everything rather than redirecting, leaves NetworkManager
+    // reporting "limited" or "none" instead — nothing answered, so it cannot
+    // know a login page exists. Those are the states you actually hit in a
+    // hotel with a VPN running, so treat them as candidates too and let the
+    // CLI decide (it stays quiet when there is no network attached).
+    if (next !== "portal" && next !== "limited" && next !== "none") return
 
     var now = Date.now()
     if (now - root.lastOpenedAt < root.reopenCooldownMs) {

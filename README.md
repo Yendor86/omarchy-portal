@@ -86,6 +86,33 @@ Detection handles the three shapes portals actually take:
 | Answers 200 with its own page | Body isn't NetworkManager's expected text |
 | Interferes with the connection | Falls back to `http://neverssl.com` |
 
+## VPNs and kill switches
+
+This is the case that actually bites, and it is worse than a plain portal.
+
+A VPN kill switch takes the default route so that nothing can leak outside the
+tunnel:
+
+```
+default via 100.85.0.1  dev pvpnksintrf0  metric 98    <- kill switch
+default via 10.107.221.65 dev wlp1s0      metric 600   <- the wifi itself
+```
+
+On hotel wifi that produces a deadlock. The tunnel cannot come up until you have
+signed in, and the kill switch blocks the sign-in page precisely because it is
+doing its job. NetworkManager reports `limited` or `none` rather than `portal`,
+because nothing answered at all — it has no way to know a login page exists.
+
+Portal handles this:
+
+- the watcher reacts to `limited` and `none` as well as `portal`, since those are
+  the states you actually hit here;
+- when a VPN or kill switch holds the default route, it does **not** open a
+  browser at a page that cannot load. It tells you to drop the VPN first;
+- with no network attached at all, it stays quiet.
+
+The order that works: **disconnect the VPN → join the wifi → sign in → reconnect.**
+
 ## Requirements
 
 Omarchy with `omarchy-shell`, NetworkManager, `curl`, `xdg-open`, and
