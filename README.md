@@ -100,8 +100,10 @@ omarchy-portal url      # just print the URL
 ```
 
 `signin` exists because doing it by hand is four steps in an order that is easy
-to get wrong at 11pm in a hotel. It remembers which VPN connections it took
-down so `vpn-up` can put exactly those back.
+to get wrong at 11pm in a hotel. It records what it is about to take down *before* dropping anything, so an
+interrupted run still leaves a trail, and `vpn-up` restores exactly those.
+If a connection fails to come back, `vpn-up` says so loudly and keeps it on
+file — it will never tell you the VPN is up when it is not.
 
 ## How it works
 
@@ -120,7 +122,7 @@ Detection handles the three shapes portals actually take:
 |---|---|
 | Redirects the check URL (30x) | `Location` header is the login page |
 | Answers 200 with its own page | Body isn't NetworkManager's expected text |
-| Interferes with the connection | Falls back to `http://neverssl.com` |
+| Interferes with the connection | Probes `http://neverssl.com`, and only acts if that actually redirects |
 
 ## VPNs and kill switches
 
@@ -142,12 +144,29 @@ because nothing answered at all — it has no way to know a login page exists.
 Portal handles this:
 
 - the watcher reacts to `limited` and `none` as well as `portal`, since those are
-  the states you actually hit here;
+  the states you actually hit here — but waits ~7s and re-reads the state first,
+  because short `limited` blips are common on healthy networks;
 - when a VPN or kill switch holds the default route, it does **not** open a
   browser at a page that cannot load. It tells you to drop the VPN first;
+- `signin` takes down whatever actually owns the default route, not just
+  things whose type looks like a VPN. Proton's kill switch is a `dummy`
+  device, so a type filter misses it — which is exactly what the first
+  version did;
 - with no network attached at all, it stays quiet.
 
 The order that works: **disconnect the VPN → join the wifi → sign in → reconnect.**
+
+## What it will not do
+
+- **Only `http` and `https` URLs are opened.** A captive portal chooses the
+  redirect target, and `xdg-open` dispatches by scheme — `file://`, `ssh://`,
+  `obsidian://` and every other registered handler on the machine. A browser
+  prompts before launching those; an automatic tool must not. Loopback
+  addresses are refused too.
+- It opens the login page in **your normal browser**, unlike the isolated
+  mini-browser some operating systems use for this. That is a deliberate
+  trade for simplicity; be aware a portal page is untrusted content in your
+  main profile.
 
 ## Requirements
 

@@ -36,6 +36,13 @@ Item {
                 (details ? ": " + details : ""))
   }
 
+  // A "limited" blip is common and short — this machine's journal shows
+  // full -> limited -> full three times in twelve minutes on working wifi.
+  // Acting on the first sight of it fired a critical VPN notification, or
+  // opened a browser, for a network that was fine two seconds later. So a
+  // non-"portal" state has to still be there after a pause before we act.
+  readonly property int settleMs: 7000
+
   function handleState(next) {
     if (next === root.lastState) return
     root.lastState = next
@@ -48,24 +55,60 @@ Item {
     // CLI decide (it stays quiet when there is no network attached).
     if (next !== "portal" && next !== "limited" && next !== "none") return
 
+    if (next === "portal") {
+      root.act("portal")
+    } else {
+      // limited/none: let it settle first.
+      settleTimer.pending = next
+      settleTimer.restart()
+    }
+  }
+
+  function act(why) {
     var now = Date.now()
     if (now - root.lastOpenedAt < root.reopenCooldownMs) {
-      logEvent("suppressed", "portal seen again inside cooldown")
+      logEvent("suppressed", "inside cooldown")
       return
     }
-    root.lastOpenedAt = now
-    logEvent("opening", "captive portal login page")
+    logEvent("running", why)
     openProcess.running = false
+    // Path passed as an ARGUMENT, not concatenated into the script text: the
+    // plugin directory is not attacker-controlled, but a space or a quote in
+    // it broke the quoting outright.
     openProcess.command = ["bash", "-lc",
-      "if [ -x '" + root.cliPath + "' ]; then '" + root.cliPath + "' open; else omarchy-portal open; fi"]
+      "if [ -x \"$1\" ]; then exec \"$1\" open; else exec omarchy-portal open; fi",
+      "omarchy-portal", root.cliPath]
     openProcess.running = true
+  }
+
+  // Re-read the state after the pause; only act if it is still not "full".
+  Timer {
+    id: settleTimer
+    property string pending: ""
+    interval: root.settleMs
+    onTriggered: recheck.running = true
+  }
+
+  Process {
+    id: recheck
+    command: ["env", "LC_ALL=C", "nmcli", "-t", "networking", "connectivity"]
+    stdout: SplitParser {
+      onRead: function (line) {
+        var st = String(line).trim()
+        if (st === "full" || st === "unknown") {
+          root.logEvent("settled", "was " + settleTimer.pending + ", now " + st + " — ignoring")
+          return
+        }
+        root.act(st + " (settled)")
+      }
+    }
   }
 
   // Event-driven: one line per change, nothing in between.
   Process {
     id: monitor
     running: true
-    command: ["bash", "-lc", "nmcli monitor"]
+    command: ["env", "LC_ALL=C", "nmcli", "monitor"]
     stdout: SplitParser {
       onRead: function (line) {
         var m = String(line).match(/Connectivity is now '([a-z]+)'/)
@@ -90,11 +133,24 @@ Item {
   Process {
     id: initialProbe
     running: true
-    command: ["bash", "-lc", "nmcli -t networking connectivity"]
+    command: ["env", "LC_ALL=C", "nmcli", "-t", "networking", "connectivity"]
     stdout: SplitParser {
       onRead: function (line) { root.handleState(String(line).trim()) }
     }
   }
 
-  Process { id: openProcess }
+  Process {
+    id: openProcess
+    // Arm the cooldown only when the CLI actually opened something. Setting
+    // it on every trigger meant a dropped connection could suppress the real
+    // portal thirty seconds later.
+    onExited: function (code) {
+      if (code === 0) {
+        root.lastOpenedAt = Date.now()
+        root.logEvent("opened", "login page")
+      } else {
+        root.logEvent("no-action", "cli exit " + code)
+      }
+    }
+  }
 }

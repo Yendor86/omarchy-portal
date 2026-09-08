@@ -12,6 +12,12 @@
 # login page".
 set -uo pipefail
 
+# nmcli translates every string this script matches — "Connectivity is now",
+# the state words, and "connected". 67 locales ship translations, so on a
+# German desktop the plugin was silently inert. Pin the locale for our own
+# parsing; it does not affect anything the user sees.
+export LC_ALL=C
+
 # Everything transient lives in one private directory. The first version wrote
 # the probe response to /tmp/.portal-body.$$ — a predictable path in a shared
 # directory. `curl -o` follows an existing symlink, so another local user could
@@ -20,7 +26,9 @@ set -uo pipefail
 # use a guessable name in a world-writable directory.
 PORTAL_TMP="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-portal.XXXXXXXX")" || exit 1
 chmod 700 "$PORTAL_TMP"
-trap 'rm -rf "$PORTAL_TMP"' EXIT INT TERM
+# EXIT alone: bash runs it on fatal signals too, and trapping INT without
+# exiting meant Ctrl+C did not actually stop the script.
+trap 'rm -rf "$PORTAL_TMP"' EXIT
 
 # State that must survive between `signin` and `vpn-up` cannot live in a
 # temporary directory. XDG_RUNTIME_DIR is per-user and mode 0700; when it is
@@ -45,6 +53,29 @@ FALLBACK_URL="http://neverssl.com"   # plain HTTP, no HSTS, always redirectable
 
 state() { nmcli -t networking connectivity 2>/dev/null || echo unknown; }
 
+# A captive portal is hostile by definition: it chooses the redirect target.
+# Unvalidated, that reaches xdg-open, which dispatches by URL scheme —
+# file://, ssh://-oProxyCommand=…, obsidian://, claude-cli://, and every
+# other registered handler on the machine. A browser asks before launching
+# those; we would not, and we would do it automatically on network join with
+# a notification vouching for it.
+#
+# So: http(s) only, no whitespace or control characters, and no loopback
+# (a portal has no business pointing at a service on this machine).
+# Real portals live on the LAN, so private ranges stay allowed.
+url_is_safe() {
+  local u="$1"
+  [[ "$u" =~ ^https?://[^[:space:][:cntrl:]]+$ ]] || return 1
+  local host="${u#*://}"; host="${host%%/*}"; host="${host%%:*}"; host="${host#*@}"
+  case "${host,,}" in
+    localhost|127.*|::1|'[::1]'|0.0.0.0) return 1 ;;
+  esac
+  return 0
+}
+
+# Never echo a portal-supplied string raw: it can carry terminal escapes.
+safe_print() { printf '%s\n' "$1" | tr -d '\000-\010\013\014\016-\037'; }
+
 # A VPN kill switch owning the default route is the one thing that makes a
 # captive portal unfixable: the tunnel cannot come up until you log in, and the
 # kill switch blocks the login page to stop exactly the kind of leak you now
@@ -64,10 +95,25 @@ killswitch_device() {
   case "$dev" in
     pvpnksintrf*|*killswitch*) echo "$dev"; return 0 ;;
   esac
-  # Also catch a plain VPN holding the default route with no route to the LAN.
-  nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
-    | grep -qiE ":(wireguard|vpn|tun)$" && { echo "$dev"; return 0; }
+  # A VPN only blocks the login page if its device owns the default route.
+  # Matching any active VPN broke split tunnels and reported the wifi device
+  # as "holding the default route".
+  local conn type
+  conn="$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)"
+  if [[ -n "$conn" ]]; then
+    type="$(nmcli -g connection.type connection show "$conn" 2>/dev/null)"
+    case "$type" in *wireguard*|*vpn*|*tun*) echo "$dev"; return 0 ;; esac
+  fi
   return 1
+}
+
+# The connection that owns the default route, whatever its type. Proton's
+# kill switch is a `dummy` device, so a type filter misses it entirely.
+default_route_connection() {
+  local dev
+  dev="$(ip route show default 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
+  [[ -n "$dev" ]] || return 1
+  nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null
 }
 
 # Returns the portal's login URL on stdout, or nothing if we are actually online.
@@ -78,14 +124,32 @@ detect_url() {
       -w '%{http_code} %{redirect_url}' "$NM_URI" 2>/dev/null || echo "000 ")
   body="$(cat "$bodyfile" 2>/dev/null)"; rm -f "$bodyfile"
   case "$code" in
-    30[0-9]) [[ -n "$redirect" ]] && { echo "$redirect"; return 0; } ;;
+    30[0-9])
+      if [[ -n "$redirect" ]]; then
+        if url_is_safe "$redirect"; then echo "$redirect"; return 0; fi
+        # A redirect we will not follow is worth saying out loud rather than
+        # silently falling through to something else.
+        echo "refused: portal redirect is not a plain http(s) URL" >&2
+        return 1
+      fi ;;
     200|204)
       # Some portals return 200 with their own page instead of redirecting.
       if [[ "$body" != *"NetworkManager is online"* && -n "$body" ]]; then
         echo "$NM_URI"; return 0
       fi
       return 1 ;;
-    000) echo "$FALLBACK_URL"; return 0 ;;   # TLS/connect interference
+    000)
+      # Not evidence of a portal. A dropped uplink, a blip, or an ISP outage
+      # all look like this, and opening a browser at neverssl.com under a
+      # "Wi-Fi needs you to sign in" banner is a lie. Probe the fallback and
+      # only act if something actually redirects it.
+      local fcode fredirect
+      read -r fcode fredirect < <(curl -sS -m 6 -o /dev/null \
+          -w '%{http_code} %{redirect_url}' "$FALLBACK_URL" 2>/dev/null || echo "000 ")
+      if [[ "$fcode" == 30* ]] && [[ -n "$fredirect" ]] && url_is_safe "$fredirect"; then
+        echo "$fredirect"; return 0
+      fi
+      return 1 ;;
   esac
   return 1
 }
@@ -112,46 +176,101 @@ open_portal() {
   fi
   notify-send -a "Portal" -i network-wireless \
     "Wi-Fi needs you to sign in" "Opening the login page…" 2>/dev/null
-  echo "Opening $url"
+  printf 'Opening '; safe_print "$url"
   xdg-open "$url" >/dev/null 2>&1 &
 }
 
 # The whole dance in one command, because doing it by hand at 11pm in a hotel
 # is four steps in an order that is easy to get wrong.
+#
+# The first version filtered active connections by type (wireguard|vpn|tun)
+# and so missed the thing it was written for: Proton's kill switch is a
+# `dummy` device, and it — not the tunnel — owns the default route. Taking
+# the tunnel down left the route in place, and the script then told the user
+# to run the command they had just run.
+#
+# Names are read one field at a time (`nmcli -g NAME`) because `-t` escapes
+# colons, and a connection called "Proton: US" split wrongly under awk -F:.
+vpn_connections() {
+  local name type
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    type="$(nmcli -g connection.type connection show "$name" 2>/dev/null)"
+    case "$type" in *wireguard*|*vpn*|*tun*) printf '%s\n' "$name" ;; esac
+  done < <(nmcli -g NAME connection show --active 2>/dev/null)
+}
+
 signin() {
-  local vpns
-  vpns="$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
-          | awk -F: '$2 ~ /wireguard|vpn|tun/ {print $1}')"
-  if [[ -n "$vpns" ]]; then
-    echo "Disconnecting VPN so the login page can load:"
-    while IFS= read -r v; do
-      [[ -z "$v" ]] && continue
-      echo "  down: $v"
-      nmcli connection down "$v" >/dev/null 2>&1
-    done <<< "$vpns"
-    sleep 2
+  local -a takedown=()
+  local n route_conn
+  while IFS= read -r n; do [[ -n "$n" ]] && takedown+=("$n"); done < <(vpn_connections)
+
+  # Whatever owns the default route goes last, and comes back first.
+  route_conn="$(default_route_connection || true)"
+  if [[ -n "$route_conn" ]]; then
+    local seen=0 t
+    for t in ${takedown[@]+"${takedown[@]}"}; do [[ "$t" == "$route_conn" ]] && seen=1; done
+    (( seen )) || takedown+=("$route_conn")
   fi
+
+  if (( ${#takedown[@]} == 0 )); then
+    echo "No VPN or kill switch is in the way."
+    open_portal || true
+    return
+  fi
+
+  # Record BEFORE dropping anything. The old order left the tunnel down with
+  # no record if the terminal closed or the probe hung in between.
+  : > "$PORTAL_VPN_STATE"
+  chmod 600 "$PORTAL_VPN_STATE" 2>/dev/null || true
+  printf '%s\n' "${takedown[@]}" > "$PORTAL_VPN_STATE"
+
+  echo "Taking down so the login page can load:"
+  local i
+  for (( i=${#takedown[@]}-1; i>=0; i-- )); do
+    echo "  down: ${takedown[$i]}"
+    nmcli connection down "${takedown[$i]}" >/dev/null 2>&1 \
+      || echo "        (failed — you may need to do this in the VPN app)"
+  done
+  sleep 2
 
   open_portal || true
   echo
-  echo "Sign in, then bring the VPN back up:"
-  while IFS= read -r v; do
-    [[ -z "$v" ]] && continue
-    echo "  omarchy-portal vpn-up   # or: nmcli connection up \"$v\""
-  done <<< "$vpns"
-  printf '%s\n' "$vpns" > "$PORTAL_VPN_STATE"
-  chmod 600 "$PORTAL_VPN_STATE" 2>/dev/null || true
+  echo "Sign in, then run:  omarchy-portal vpn-up"
 }
 
 vpn_up() {
   local f="$PORTAL_VPN_STATE"
   [[ -s "$f" ]] || { echo "No VPN was taken down by Portal."; return 1; }
-  while IFS= read -r v; do
-    [[ -z "$v" ]] && continue
-    echo "  up: $v"; nmcli connection up "$v" >/dev/null 2>&1
-  done < "$f"
+
+  local -a names=() failed=()
+  local n
+  while IFS= read -r n; do [[ -n "$n" ]] && names+=("$n"); done < "$f"
+  (( ${#names[@]} )) || { rm -f "$f"; echo "Nothing recorded to restore."; return 1; }
+
+  # Restore in the order taken down reversed: the route owner (kill switch)
+  # first, then the tunnel.
+  for n in "${names[@]}"; do
+    if nmcli connection up "$n" >/dev/null 2>&1; then
+      echo "  up: $n"
+    else
+      echo "  FAILED: $n"
+      failed+=("$n")
+    fi
+  done
+
+  if (( ${#failed[@]} )); then
+    # Never claim protection we did not verify. Keep the failures on file so
+    # a second vpn-up retries exactly those.
+    printf '%s\n' "${failed[@]}" > "$f"
+    notify-send -u critical -a "Portal" -i network-vpn \
+      "VPN did NOT reconnect" "Still down: ${failed[*]}. You are not tunnelled." 2>/dev/null
+    echo "Not reconnected: ${failed[*]}"
+    return 1
+  fi
+
   rm -f "$f"
-  notify-send -a "Portal" -i network-vpn "VPN reconnected" 2>/dev/null
+  notify-send -a "Portal" -i network-vpn "VPN reconnected" "${names[*]}" 2>/dev/null
 }
 
 case "${1:-open}" in
@@ -162,7 +281,7 @@ case "${1:-open}" in
     echo "connectivity: $(state)"
     if ks="$(killswitch_device)"; then echo "vpn: holding the default route via $ks — sign-in will fail until it is off"
     else echo "vpn: not in the way"; fi
-    u="$(detect_url)" && echo "portal: $u" || echo "portal: none" ;;
+    if u="$(detect_url)"; then printf 'portal: '; safe_print "$u"; else echo "portal: none"; fi ;;
   url)    detect_url ;;
   *) echo "usage: omarchy-portal [open|signin|vpn-up|status|url]" >&2; exit 2 ;;
 esac
