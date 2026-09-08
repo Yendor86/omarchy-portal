@@ -53,7 +53,18 @@ shell still logs `Local plugin changed, reloading`, reports no error, and simply
 never instantiates the service. Your shell.json is backed up to `shell.json.bak`
 first.
 
-Plugins reload on save; if it doesn't pick up, `omarchy-shell shell rescanPlugins`.
+Plugins reload on save — **but not through a symlink**. Because the installer
+symlinks `~/.config/omarchy/plugins/yendor.portal` to wherever you cloned this,
+the shell's inotify watch does not see edits to the real files. After a
+`git pull` (or any edit), run:
+
+```bash
+omarchy-shell shell rescanPlugins
+```
+
+You can tell it worked because the `nmcli monitor` process gets a new pid.
+This bit us during development: the service kept running old code while
+reporting that the plugin had reloaded.
 
 ## Use
 
@@ -62,10 +73,16 @@ Nothing, normally — that's the point. It watches and acts on its own.
 When you want to drive it by hand:
 
 ```bash
-omarchy-portal status   # connectivity state, and the portal URL if there is one
+omarchy-portal status   # connectivity state, VPN interference, and the portal URL
+omarchy-portal signin   # the whole dance: drop the VPN, open the login page
+omarchy-portal vpn-up   # put the VPN back after you have signed in
 omarchy-portal open     # open the login page now
 omarchy-portal url      # just print the URL
 ```
+
+`signin` exists because doing it by hand is four steps in an order that is easy
+to get wrong at 11pm in a hotel. It remembers which VPN connections it took
+down so `vpn-up` can put exactly those back.
 
 ## How it works
 

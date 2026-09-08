@@ -77,9 +77,10 @@ open_portal() {
   if ks="$(killswitch_device)"; then
     notify-send -u critical -a "Portal" -i network-vpn \
       "Turn the VPN off to sign in" \
-      "A VPN kill switch is blocking the wifi login page. Disconnect the VPN, sign in, then reconnect." 2>/dev/null
+      "Run: omarchy-portal signin — drops the VPN, opens the login page, and reminds you to reconnect." 2>/dev/null
     echo "A VPN or kill switch holds the default route (via $ks)."
-    echo "The login page cannot load until it is off. Disconnect the VPN, sign in, then reconnect."
+    echo "The login page cannot load until it is off."
+    echo "Run:  omarchy-portal signin   (drops the VPN, opens the page, reconnects after)"
     return 2
   fi
   local url; url="$(detect_url)" || url=""
@@ -93,13 +94,52 @@ open_portal() {
   xdg-open "$url" >/dev/null 2>&1 &
 }
 
+# The whole dance in one command, because doing it by hand at 11pm in a hotel
+# is four steps in an order that is easy to get wrong.
+signin() {
+  local vpns
+  vpns="$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
+          | awk -F: '$2 ~ /wireguard|vpn|tun/ {print $1}')"
+  if [[ -n "$vpns" ]]; then
+    echo "Disconnecting VPN so the login page can load:"
+    while IFS= read -r v; do
+      [[ -z "$v" ]] && continue
+      echo "  down: $v"
+      nmcli connection down "$v" >/dev/null 2>&1
+    done <<< "$vpns"
+    sleep 2
+  fi
+
+  open_portal || true
+  echo
+  echo "Sign in, then bring the VPN back up:"
+  while IFS= read -r v; do
+    [[ -z "$v" ]] && continue
+    echo "  omarchy-portal vpn-up   # or: nmcli connection up \"$v\""
+  done <<< "$vpns"
+  printf '%s\n' "$vpns" > "${XDG_RUNTIME_DIR:-/tmp}/omarchy-portal-vpn"
+}
+
+vpn_up() {
+  local f="${XDG_RUNTIME_DIR:-/tmp}/omarchy-portal-vpn"
+  [[ -s "$f" ]] || { echo "No VPN was taken down by Portal."; return 1; }
+  while IFS= read -r v; do
+    [[ -z "$v" ]] && continue
+    echo "  up: $v"; nmcli connection up "$v" >/dev/null 2>&1
+  done < "$f"
+  rm -f "$f"
+  notify-send -a "Portal" -i network-vpn "VPN reconnected" 2>/dev/null
+}
+
 case "${1:-open}" in
   open)   open_portal ;;
+  signin) signin ;;
+  vpn-up) vpn_up ;;
   status)
     echo "connectivity: $(state)"
     if ks="$(killswitch_device)"; then echo "vpn: holding the default route via $ks — sign-in will fail until it is off"
     else echo "vpn: not in the way"; fi
     u="$(detect_url)" && echo "portal: $u" || echo "portal: none" ;;
   url)    detect_url ;;
-  *) echo "usage: omarchy-portal [open|status|url]" >&2; exit 2 ;;
+  *) echo "usage: omarchy-portal [open|signin|vpn-up|status|url]" >&2; exit 2 ;;
 esac
