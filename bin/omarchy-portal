@@ -12,6 +12,27 @@
 # login page".
 set -uo pipefail
 
+# Everything transient lives in one private directory. The first version wrote
+# the probe response to /tmp/.portal-body.$$ — a predictable path in a shared
+# directory. `curl -o` follows an existing symlink, so another local user could
+# pre-create that name and have Portal truncate any file the running user can
+# write. Reported by HANCORE-linux in marketplace review; the fix is to never
+# use a guessable name in a world-writable directory.
+PORTAL_TMP="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-portal.XXXXXXXX")" || exit 1
+chmod 700 "$PORTAL_TMP"
+trap 'rm -rf "$PORTAL_TMP"' EXIT INT TERM
+
+# State that must survive between `signin` and `vpn-up` cannot live in a
+# temporary directory. XDG_RUNTIME_DIR is per-user and mode 0700; when it is
+# unset, fall back to the user's own state directory rather than to /tmp.
+if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" ]]; then
+  PORTAL_STATE_DIR="$XDG_RUNTIME_DIR/omarchy-portal"
+else
+  PORTAL_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-portal"
+fi
+mkdir -p "$PORTAL_STATE_DIR" && chmod 700 "$PORTAL_STATE_DIR"
+PORTAL_VPN_STATE="$PORTAL_STATE_DIR/vpn-taken-down"
+
 # NetworkManager's own check URL, so we test exactly what it tested.
 # Overridable so the detection branches can be exercised without an actual
 # hotel between you and the internet.
@@ -52,9 +73,10 @@ killswitch_device() {
 # Returns the portal's login URL on stdout, or nothing if we are actually online.
 detect_url() {
   local code redirect body
-  read -r code redirect < <(curl -sS -m 6 -o /tmp/.portal-body.$$ \
+  local bodyfile="$PORTAL_TMP/body"
+  read -r code redirect < <(curl -sS -m 6 -o "$bodyfile" \
       -w '%{http_code} %{redirect_url}' "$NM_URI" 2>/dev/null || echo "000 ")
-  body="$(cat /tmp/.portal-body.$$ 2>/dev/null)"; rm -f /tmp/.portal-body.$$
+  body="$(cat "$bodyfile" 2>/dev/null)"; rm -f "$bodyfile"
   case "$code" in
     30[0-9]) [[ -n "$redirect" ]] && { echo "$redirect"; return 0; } ;;
     200|204)
@@ -117,11 +139,12 @@ signin() {
     [[ -z "$v" ]] && continue
     echo "  omarchy-portal vpn-up   # or: nmcli connection up \"$v\""
   done <<< "$vpns"
-  printf '%s\n' "$vpns" > "${XDG_RUNTIME_DIR:-/tmp}/omarchy-portal-vpn"
+  printf '%s\n' "$vpns" > "$PORTAL_VPN_STATE"
+  chmod 600 "$PORTAL_VPN_STATE" 2>/dev/null || true
 }
 
 vpn_up() {
-  local f="${XDG_RUNTIME_DIR:-/tmp}/omarchy-portal-vpn"
+  local f="$PORTAL_VPN_STATE"
   [[ -s "$f" ]] || { echo "No VPN was taken down by Portal."; return 1; }
   while IFS= read -r v; do
     [[ -z "$v" ]] && continue
