@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Captive portal assistant.
+#
+# NetworkManager already fetches a known plain-HTTP URL every time you join a
+# network, and flips its connectivity state to "portal" when something answers
+# with a redirect instead of the expected body. That signal is correct and is
+# then dropped on the floor: nothing in the desktop reacts to it.
+#
+# This finds the actual login URL and opens it. HTTPS is useless for this —
+# a portal intercepting an HSTS site gives a TLS error rather than a redirect,
+# which is why "the wifi is broken" so often means "nobody showed you the
+# login page".
+set -uo pipefail
+
+# NetworkManager's own check URL, so we test exactly what it tested.
+# Overridable so the detection branches can be exercised without an actual
+# hotel between you and the internet.
+if [[ -z "${NM_URI:-}" ]]; then
+  NM_URI="$(sed -n 's/^uri=//p' /usr/lib/NetworkManager/conf.d/*connectivity*.conf \
+            /etc/NetworkManager/conf.d/*.conf 2>/dev/null | head -1)"
+fi
+: "${NM_URI:=http://ping.archlinux.org/nm-check.txt}"
+FALLBACK_URL="http://neverssl.com"   # plain HTTP, no HSTS, always redirectable
+
+state() { nmcli -t networking connectivity 2>/dev/null || echo unknown; }
+
+# Returns the portal's login URL on stdout, or nothing if we are actually online.
+detect_url() {
+  local code redirect body
+  read -r code redirect < <(curl -sS -m 6 -o /tmp/.portal-body.$$ \
+      -w '%{http_code} %{redirect_url}' "$NM_URI" 2>/dev/null || echo "000 ")
+  body="$(cat /tmp/.portal-body.$$ 2>/dev/null)"; rm -f /tmp/.portal-body.$$
+  case "$code" in
+    30[0-9]) [[ -n "$redirect" ]] && { echo "$redirect"; return 0; } ;;
+    200|204)
+      # Some portals return 200 with their own page instead of redirecting.
+      if [[ "$body" != *"NetworkManager is online"* && -n "$body" ]]; then
+        echo "$NM_URI"; return 0
+      fi
+      return 1 ;;
+    000) echo "$FALLBACK_URL"; return 0 ;;   # TLS/connect interference
+  esac
+  return 1
+}
+
+open_portal() {
+  local url; url="$(detect_url)" || url=""
+  if [[ -z "$url" ]]; then
+    echo "No captive portal detected — connectivity is '$(state)'."
+    return 1
+  fi
+  notify-send -a "Portal" -i network-wireless \
+    "Wi-Fi needs you to sign in" "Opening the login page…" 2>/dev/null
+  echo "Opening $url"
+  xdg-open "$url" >/dev/null 2>&1 &
+}
+
+case "${1:-open}" in
+  open)   open_portal ;;
+  status) echo "connectivity: $(state)"; u="$(detect_url)" && echo "portal: $u" || echo "portal: none" ;;
+  url)    detect_url ;;
+  *) echo "usage: omarchy-portal [open|status|url]" >&2; exit 2 ;;
+esac
