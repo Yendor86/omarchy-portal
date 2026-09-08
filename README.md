@@ -36,6 +36,25 @@ real login URL, and opens it.
 ## Install
 
 ```bash
+omarchy plugin add https://github.com/Yendor86/omarchy-portal.git --enable
+```
+
+That is the whole thing. Omarchy clones the repo into
+`~/.config/omarchy/plugins/yendor.portal`, validates the manifest, and `--enable`
+adds it to `shell.json`. Remove it with `omarchy plugin remove yendor.portal`.
+
+The `omarchy-portal` CLI is inside the plugin at `bin/omarchy-portal`. Put it on
+your PATH if you want to run it by hand:
+
+```bash
+ln -sfn ~/.config/omarchy/plugins/yendor.portal/bin/omarchy-portal ~/.local/bin/
+```
+
+### From a git checkout instead
+
+If you would rather work on it in place:
+
+```bash
 git clone https://github.com/Yendor86/omarchy-portal.git ~/code/omarchy-portal
 ~/code/omarchy-portal/install.sh
 ```

@@ -18,6 +18,13 @@ Item {
 
   property var shell: null
 
+  // Resolve the CLI next to this file rather than trusting PATH. Installing
+  // via `omarchy plugin add` clones the repo straight into the plugins
+  // directory and never runs install.sh, so ~/.local/bin/omarchy-portal will
+  // not exist. Falling back to PATH keeps a symlinked dev checkout working.
+  readonly property string cliPath:
+    Qt.resolvedUrl("bin/omarchy-portal").toString().replace(/^file:\/\//, "")
+
   // Guard against re-opening the browser every time NM re-checks while the
   // user is still typing their room number into the login page.
   property string lastState: ""
@@ -49,7 +56,8 @@ Item {
     root.lastOpenedAt = now
     logEvent("opening", "captive portal login page")
     openProcess.running = false
-    openProcess.command = ["bash", "-lc", "omarchy-portal open"]
+    openProcess.command = ["bash", "-lc",
+      "if [ -x '" + root.cliPath + "' ]; then '" + root.cliPath + "' open; else omarchy-portal open; fi"]
     openProcess.running = true
   }
 
