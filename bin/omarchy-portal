@@ -63,14 +63,54 @@ state() { nmcli -t networking connectivity 2>/dev/null || echo unknown; }
 # So: http(s) only, no whitespace or control characters, and no loopback
 # (a portal has no business pointing at a service on this machine).
 # Real portals live on the LAN, so private ranges stay allowed.
+#
+# The shell version of this check was bypassable and is gone. It did
+# `host="${host%%:*}"`, which truncates a bracketed IPv6 literal at its FIRST
+# colon: "[::1]" became "[", matching nothing, so the `'[::1]'` case arm was
+# dead code and every IPv6 loopback form sailed through. Eight forms reached
+# xdg-open in testing — [::1], [::1]:8080, [0:0:0:0:0:0:0:1],
+# [::ffff:127.0.0.1], 2130706433, 0177.0.0.1, localhost. and user@[::1]:9.
+# Reported by HANCORE-linux in marketplace review.
+#
+# Host parsing and IP classification are not things to hand-roll in shell, so
+# they are done by urllib.parse + ipaddress, which canonicalise IPv6, IPv4
+# mapped forms, and the legacy integer/octal/hex IPv4 spellings that browsers
+# still honour. If python3 is unavailable we refuse rather than fall back to a
+# weaker check: this is a security boundary, so it fails CLOSED.
+PORTAL_URLGUARD='
+import sys, socket, ipaddress
+from urllib.parse import urlsplit
+def safe(u):
+    if not u or len(u) > 2048: return False
+    if any(ord(c) < 0x21 or ord(c) == 0x7f for c in u): return False
+    try: p = urlsplit(u)
+    except ValueError: return False
+    if p.scheme not in ("http", "https"): return False
+    try: host = p.hostname
+    except ValueError: return False
+    if not host: return False
+    host = host.rstrip(".").lower()
+    if not host: return False
+    if host == "localhost" or host.endswith(".localhost"): return False
+    ip = None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        try: ip = ipaddress.ip_address(socket.inet_aton(host))
+        except (OSError, ValueError): ip = None
+    if ip is not None:
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
+            return False
+    return True
+sys.exit(0 if (len(sys.argv) == 2 and safe(sys.argv[1])) else 1)
+'
 url_is_safe() {
   local u="$1"
   [[ "$u" =~ ^https?://[^[:space:][:cntrl:]]+$ ]] || return 1
-  local host="${u#*://}"; host="${host%%/*}"; host="${host%%:*}"; host="${host#*@}"
-  case "${host,,}" in
-    localhost|127.*|::1|'[::1]'|0.0.0.0) return 1 ;;
-  esac
-  return 0
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c "$PORTAL_URLGUARD" "$u" 2>/dev/null
 }
 
 # Never echo a portal-supplied string raw: it can carry terminal escapes.
@@ -116,13 +156,42 @@ default_route_connection() {
   nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null
 }
 
+# A captive portal controls the response, so the response has to be bounded
+# before we read it. The old code did `curl -o file` with no ceiling and then
+# `body="$(cat file)"` — command substitution of an attacker-sized body, which
+# a hostile portal can turn into a disk-fill and a memory blow-up on network
+# join. Reported by HANCORE-linux in marketplace review.
+#
+# Two independent ceilings, because either alone can be evaded:
+#   --max-filesize  refuses before transfer when Content-Length is honest
+#   ulimit -f       kills curl with SIGXFSZ when it is not (chunked, or lying)
+# and -m 6 bounds the time. A body that trips either is not a portal we will
+# act on, so falling through to "000" is the correct outcome, not a loss.
+PORTAL_MAX_BODY=65536          # bytes
+PORTAL_MAX_BLOCKS=128          # 512-byte blocks == the same 64 KiB
+PORTAL_MAX_URL=2048            # a Location header is not allowed to be a payload
+
+fetch_bounded() {
+  # $1 url, $2 body destination. Echoes "<http_code> <redirect_url>".
+  local out
+  out="$( ( ulimit -f "$PORTAL_MAX_BLOCKS" 2>/dev/null
+             curl -sS -m 6 --max-filesize "$PORTAL_MAX_BODY" -o "$2" \
+                  -w '%{http_code} %{redirect_url}' "$1" ) 2>/dev/null )" || out=""
+  [[ -n "$out" ]] || out="000 "
+  printf '%s' "$out"
+}
+
 # Returns the portal's login URL on stdout, or nothing if we are actually online.
 detect_url() {
   local code redirect body
   local bodyfile="$PORTAL_TMP/body"
-  read -r code redirect < <(curl -sS -m 6 -o "$bodyfile" \
-      -w '%{http_code} %{redirect_url}' "$NM_URI" 2>/dev/null || echo "000 ")
-  body="$(cat "$bodyfile" 2>/dev/null)"; rm -f "$bodyfile"
+  read -r code redirect < <(fetch_bounded "$NM_URI" "$bodyfile")
+  # Refuse an over-long Location rather than truncate it: a truncated URL is a
+  # DIFFERENT URL, and silently opening a different one is its own bug.
+  (( ${#redirect} <= PORTAL_MAX_URL )) || redirect=""
+  # head, not cat: the file is already capped, but never grow a shell variable
+  # to whatever happens to be on disk.
+  body="$(head -c "$PORTAL_MAX_BODY" "$bodyfile" 2>/dev/null)"; rm -f "$bodyfile"
   case "$code" in
     30[0-9])
       if [[ -n "$redirect" ]]; then
@@ -144,8 +213,8 @@ detect_url() {
       # "Wi-Fi needs you to sign in" banner is a lie. Probe the fallback and
       # only act if something actually redirects it.
       local fcode fredirect
-      read -r fcode fredirect < <(curl -sS -m 6 -o /dev/null \
-          -w '%{http_code} %{redirect_url}' "$FALLBACK_URL" 2>/dev/null || echo "000 ")
+      read -r fcode fredirect < <(fetch_bounded "$FALLBACK_URL" /dev/null)
+      (( ${#fredirect} <= PORTAL_MAX_URL )) || fredirect=""
       if [[ "$fcode" == 30* ]] && [[ -n "$fredirect" ]] && url_is_safe "$fredirect"; then
         echo "$fredirect"; return 0
       fi

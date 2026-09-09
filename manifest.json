@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "yendor.portal",
   "name": "Portal",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "Rodney Baker",
   "license": "MIT",
   "description": "Captive portal assistant for Omarchy. NetworkManager already detects hotel, cafe and airport wifi login pages \u2014 it just never tells you. Portal watches for that, notifies you, and opens the login page in your browser, the way Windows, macOS and Android have always done.",
