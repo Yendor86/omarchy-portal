@@ -170,8 +170,19 @@ The order that works: **disconnect the VPN → join the wifi → sign in → rec
 
 ## Requirements
 
-Omarchy with `omarchy-shell`, NetworkManager, `curl`, `xdg-open`, and
-`notify-send`. All of these are already on a stock Omarchy install.
+Omarchy with `omarchy-shell`, NetworkManager, `curl`, `xdg-open`,
+`notify-send`, and `python3`. All of these are present on a stock Omarchy
+install — `python3` arrives with `uwsm`, which Omarchy uses to start the
+Hyprland session.
+
+`python3` is used for one thing only: deciding whether a URL handed to us by
+the network is safe to open. Host parsing and IP classification are far too
+easy to get wrong in shell — the previous shell implementation truncated
+bracketed IPv6 at the first colon and let every loopback form through — so
+that check uses `urllib.parse` and `ipaddress`, which canonicalise IPv6,
+IPv4-mapped addresses, and the legacy integer/octal/hex spellings browsers
+still honour. If `python3` is missing, Portal refuses to open anything rather
+than falling back to a weaker check: it fails closed.
 
 ## Licence
 
