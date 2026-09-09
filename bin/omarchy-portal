@@ -78,17 +78,30 @@ state() { nmcli -t networking connectivity 2>/dev/null || echo unknown; }
 # still honour. If python3 is unavailable we refuse rather than fall back to a
 # weaker check: this is a security boundary, so it fails CLOSED.
 PORTAL_URLGUARD='
-import sys, socket, ipaddress
+import sys, socket, ipaddress, unicodedata
 from urllib.parse import urlsplit
 def safe(u):
     if not u or len(u) > 2048: return False
     if any(ord(c) < 0x21 or ord(c) == 0x7f for c in u): return False
+    # A backslash is a SLASH in a WHATWG http(s) URL, so the browser reads
+    # "http://localhost:80\@evil.example/" as host localhost — while urlsplit
+    # reads host evil.example. Two parsers, two answers, and the browser wins.
+    # No legitimate URL needs a raw backslash, so refuse the character outright.
+    if "\\" in u: return False
     try: p = urlsplit(u)
     except ValueError: return False
     if p.scheme not in ("http", "https"): return False
     try: host = p.hostname
     except ValueError: return False
     if not host: return False
+    # The browser folds the hostname through IDNA/UTS46 before it resolves it,
+    # so full-width and lookalike forms become ASCII AFTER we would have waved
+    # them through: localhost and 127.0.0.1 both round-trip that way.
+    # Normalise the same way, then classify what is left.
+    host = unicodedata.normalize("NFKC", host)
+    if not host.isascii():
+        try: host = host.encode("idna").decode("ascii")
+        except (UnicodeError, UnicodeDecodeError): return False
     host = host.rstrip(".").lower()
     if not host: return False
     if host == "localhost" or host.endswith(".localhost"): return False
@@ -110,11 +123,17 @@ url_is_safe() {
   local u="$1"
   [[ "$u" =~ ^https?://[^[:space:][:cntrl:]]+$ ]] || return 1
   command -v python3 >/dev/null 2>&1 || return 1
-  python3 -c "$PORTAL_URLGUARD" "$u" 2>/dev/null
+  # -I: isolated. Without it python3 imports from the process CWD, so a stray
+  # ~/ipaddress.py or ~/socket.py silently replaces the security boundary.
+  python3 -I -c "$PORTAL_URLGUARD" "$u" 2>/dev/null
 }
 
 # Never echo a portal-supplied string raw: it can carry terminal escapes.
-safe_print() { printf '%s\n' "$1" | tr -d '\000-\010\013\014\016-\037'; }
+# Allow-list rather than deny-list: a validated URL is ASCII by the time it
+# gets here, so anything outside printable ASCII is not part of it. The old
+# deny-list missed C1 (ESC-less 0x80-0x9F, which some terminals act on) and
+# bidi overrides.
+safe_print() { printf '%s\n' "$1" | LC_ALL=C tr -cd '\40-\176\n'; }
 
 # A VPN kill switch owning the default route is the one thing that makes a
 # captive portal unfixable: the tunnel cannot come up until you log in, and the
@@ -141,7 +160,7 @@ killswitch_device() {
   local conn type
   conn="$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)"
   if [[ -n "$conn" ]]; then
-    type="$(nmcli -g connection.type connection show "$conn" 2>/dev/null)"
+    type="$(nmcli -g connection.type connection show id "$conn" 2>/dev/null)"
     case "$type" in *wireguard*|*vpn*|*tun*) echo "$dev"; return 0 ;; esac
   fi
   return 1
@@ -231,7 +250,7 @@ open_portal() {
   fi
   if ks="$(killswitch_device)"; then
     notify-send -u critical -a "Portal" -i network-vpn \
-      "Turn the VPN off to sign in" \
+      -- "Turn the VPN off to sign in" \
       "Run: omarchy-portal signin — drops the VPN, opens the login page, and reminds you to reconnect." 2>/dev/null
     echo "A VPN or kill switch holds the default route (via $ks)."
     echo "The login page cannot load until it is off."
@@ -244,7 +263,7 @@ open_portal() {
     return 1
   fi
   notify-send -a "Portal" -i network-wireless \
-    "Wi-Fi needs you to sign in" "Opening the login page…" 2>/dev/null
+    -- "Wi-Fi needs you to sign in" "Opening the login page…" 2>/dev/null
   printf 'Opening '; safe_print "$url"
   xdg-open "$url" >/dev/null 2>&1 &
 }
@@ -264,7 +283,7 @@ vpn_connections() {
   local name type
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
-    type="$(nmcli -g connection.type connection show "$name" 2>/dev/null)"
+    type="$(nmcli -g connection.type connection show id "$name" 2>/dev/null)"
     case "$type" in *wireguard*|*vpn*|*tun*) printf '%s\n' "$name" ;; esac
   done < <(nmcli -g NAME connection show --active 2>/dev/null)
 }
@@ -274,12 +293,24 @@ signin() {
   local n route_conn
   while IFS= read -r n; do [[ -n "$n" ]] && takedown+=("$n"); done < <(vpn_connections)
 
-  # Whatever owns the default route goes last, and comes back first.
+  # Whatever owns the default route goes last, and comes back first — but ONLY
+  # if it is actually a tunnel. With no VPN running the default route belongs
+  # to the wifi, and the old code added it unconditionally: `signin` then took
+  # down the very network you were trying to log in to, and a later `vpn-up`
+  # announced "VPN reconnected — <your SSID>". That also made the "No VPN or
+  # kill switch is in the way" branch below unreachable whenever a route
+  # existed at all. Found by an adversarial audit, reproduced on live wifi.
   route_conn="$(default_route_connection || true)"
   if [[ -n "$route_conn" ]]; then
-    local seen=0 t
-    for t in ${takedown[@]+"${takedown[@]}"}; do [[ "$t" == "$route_conn" ]] && seen=1; done
-    (( seen )) || takedown+=("$route_conn")
+    local rtype
+    rtype="$(nmcli -g connection.type connection show id "$route_conn" 2>/dev/null)"
+    case "$rtype" in
+      *wireguard*|*vpn*|*tun*|*dummy*)
+        local seen=0 t
+        for t in ${takedown[@]+"${takedown[@]}"}; do [[ "$t" == "$route_conn" ]] && seen=1; done
+        (( seen )) || takedown+=("$route_conn") ;;
+      *) : ;;   # wifi or ethernet owns the route => nothing is in the way
+    esac
   fi
 
   if (( ${#takedown[@]} == 0 )); then
@@ -290,15 +321,20 @@ signin() {
 
   # Record BEFORE dropping anything. The old order left the tunnel down with
   # no record if the terminal closed or the probe hung in between.
-  : > "$PORTAL_VPN_STATE"
+  # If the record cannot be written, do NOT take the tunnel down — otherwise
+  # the VPN goes away with nothing to restore it from.
+  if ! : > "$PORTAL_VPN_STATE" 2>/dev/null; then
+    echo "Could not write $PORTAL_VPN_STATE — refusing to drop the VPN with no way back." >&2
+    return 1
+  fi
   chmod 600 "$PORTAL_VPN_STATE" 2>/dev/null || true
   printf '%s\n' "${takedown[@]}" > "$PORTAL_VPN_STATE"
 
   echo "Taking down so the login page can load:"
   local i
   for (( i=${#takedown[@]}-1; i>=0; i-- )); do
-    echo "  down: ${takedown[$i]}"
-    nmcli connection down "${takedown[$i]}" >/dev/null 2>&1 \
+    printf '  down: '; safe_print "${takedown[$i]}"
+    nmcli connection down id "${takedown[$i]}" >/dev/null 2>&1 \
       || echo "        (failed — you may need to do this in the VPN app)"
   done
   sleep 2
@@ -320,10 +356,10 @@ vpn_up() {
   # Restore in the order taken down reversed: the route owner (kill switch)
   # first, then the tunnel.
   for n in "${names[@]}"; do
-    if nmcli connection up "$n" >/dev/null 2>&1; then
-      echo "  up: $n"
+    if nmcli connection up id "$n" >/dev/null 2>&1; then
+      printf '  up: '; safe_print "$n"
     else
-      echo "  FAILED: $n"
+      printf '  FAILED: '; safe_print "$n"
       failed+=("$n")
     fi
   done
@@ -333,13 +369,13 @@ vpn_up() {
     # a second vpn-up retries exactly those.
     printf '%s\n' "${failed[@]}" > "$f"
     notify-send -u critical -a "Portal" -i network-vpn \
-      "VPN did NOT reconnect" "Still down: ${failed[*]}. You are not tunnelled." 2>/dev/null
+      -- "VPN did NOT reconnect" "Still down: ${failed[*]}. You are not tunnelled." 2>/dev/null
     echo "Not reconnected: ${failed[*]}"
     return 1
   fi
 
   rm -f "$f"
-  notify-send -a "Portal" -i network-vpn "VPN reconnected" "${names[*]}" 2>/dev/null
+  notify-send -a "Portal" -i network-vpn -- "VPN reconnected" "${names[*]}" 2>/dev/null
 }
 
 case "${1:-open}" in
