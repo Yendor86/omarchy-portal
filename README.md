@@ -148,10 +148,11 @@ Portal handles this:
   because short `limited` blips are common on healthy networks;
 - when a VPN or kill switch holds the default route, it does **not** open a
   browser at a page that cannot load. It tells you to drop the VPN first;
-- `signin` takes down whatever actually owns the default route, not just
-  things whose type looks like a VPN. Proton's kill switch is a `dummy`
-  device, so a type filter misses it — which is exactly what the first
-  version did;
+- `signin` takes down the VPN **and** its kill switch, including Proton's,
+  which is a `dummy` device that a naive type filter misses. It will **not**
+  take down your wifi: an earlier version added whatever owned the default
+  route unconditionally, which meant disconnecting the very network you were
+  trying to sign in to, and then reporting it as a reconnected VPN;
 - with no network attached at all, it stays quiet.
 
 The order that works: **disconnect the VPN → join the wifi → sign in → reconnect.**
@@ -163,10 +164,27 @@ The order that works: **disconnect the VPN → join the wifi → sign in → rec
   `obsidian://` and every other registered handler on the machine. A browser
   prompts before launching those; an automatic tool must not. Loopback
   addresses are refused too.
-- It opens the login page in **your normal browser**, unlike the isolated
-  mini-browser some operating systems use for this. That is a deliberate
-  trade for simplicity; be aware a portal page is untrusted content in your
-  main profile.
+
+## What this cannot protect you from
+
+Portal validates the URL a captive portal hands it, and refuses anything that
+is not plain `http(s)` pointing somewhere other than your own machine. Three
+things are worth being straight about, because no amount of URL validation
+fixes them:
+
+- **The attacker owns DNS.** A hostile network can point an ordinary-looking
+  hostname at `127.0.0.1`. The address checks catch literals, not resolution,
+  and no browser refuses top-level navigation to a host that resolves locally.
+- **Opening a page sends your cookies.** A forced top-level navigation carries
+  `SameSite=Lax` cookies to whatever host the portal names. That is true of any
+  captive-portal helper that uses your normal browser.
+- **It opens your normal browser.** macOS, iOS and Android use a dedicated,
+  isolated captive-portal browser for exactly these reasons. `xdg-open` has no
+  way to express "open this in a throwaway private window", so Portal cannot
+  do the same.
+
+If that matters to you, sign in by hand: `omarchy-portal url` prints the login
+URL without opening it, and you can paste it into a private window yourself.
 
 ## Requirements
 
